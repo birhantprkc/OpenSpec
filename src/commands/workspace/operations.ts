@@ -3,17 +3,18 @@ import * as path from 'node:path';
 
 import {
   WorkspaceLocalState,
+  WorkspacePreferredOpener,
   WorkspaceRegistryEntry,
   WorkspaceRegistryState,
   WorkspaceSharedState,
   getManagedWorkspaceRoot,
   getWorkspaceChangesDir,
-  getWorkspacePortableIgnorePatterns,
   isWorkspaceRoot,
   parseWorkspaceSetupLinkInput,
   readOptionalWorkspaceLocalState,
   readWorkspaceRegistryState,
   readWorkspaceSharedState,
+  syncWorkspaceOpenSurface,
   validateWorkspaceLinkName,
   validateWorkspaceName,
   writeWorkspaceLocalState,
@@ -49,11 +50,13 @@ export async function readRegistry(): Promise<WorkspaceRegistryState> {
 
 async function recordWorkspaceInRegistry(name: string, workspaceRoot: string): Promise<void> {
   const registry = await readRegistry();
+  const recordedWorkspaceRoot = normalizeExistingPathForStorage(workspaceRoot);
+
   await writeWorkspaceRegistryState({
     version: 1,
     workspaces: {
       ...registry.workspaces,
-      [name]: workspaceRoot,
+      [name]: recordedWorkspaceRoot,
     },
   });
 }
@@ -66,12 +69,10 @@ export async function directoryExists(dirPath: string): Promise<boolean> {
   }
 }
 
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    return (await fs.stat(filePath)).isFile();
-  } catch {
-    return false;
-  }
+function normalizeExistingPathForStorage(existingPath: string): string {
+  return process.platform === 'win32'
+    ? FileSystemUtils.canonicalizeExistingPath(existingPath)
+    : existingPath;
 }
 
 export async function resolveExistingDirectory(
@@ -100,7 +101,7 @@ export async function resolveExistingDirectory(
     );
   }
 
-  return resolvedPath;
+  return normalizeExistingPathForStorage(resolvedPath);
 }
 
 export function inferLinkName(absolutePath: string): string {
@@ -222,32 +223,10 @@ async function readLocalStateForMutation(workspaceRoot: string): Promise<Workspa
   }
 }
 
-async function ensureWorkspaceGitignore(workspaceRoot: string): Promise<void> {
-  const gitignorePath = path.join(workspaceRoot, '.gitignore');
-  const patterns = getWorkspacePortableIgnorePatterns();
-  const existingContent = (await fileExists(gitignorePath))
-    ? await fs.readFile(gitignorePath, 'utf-8')
-    : '';
-  const existingLines = new Set(
-    existingContent
-      .split(/\r?\n/u)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0)
-  );
-  const missingPatterns = patterns.filter((pattern) => !existingLines.has(pattern));
-
-  if (missingPatterns.length === 0) {
-    return;
-  }
-
-  const prefix = existingContent.length > 0 && !existingContent.endsWith('\n') ? '\n' : '';
-  const content = `${existingContent}${prefix}${missingPatterns.join('\n')}\n`;
-  await fs.writeFile(gitignorePath, content, 'utf-8');
-}
-
 export async function createManagedWorkspace(
   name: string,
-  links: Record<string, string>
+  links: Record<string, string>,
+  preferredOpener?: WorkspacePreferredOpener
 ): Promise<WorkspaceOutput> {
   const workspaceName = validateWorkspaceNameForSetup(name);
   const workspaceRoot = getManagedWorkspaceRoot(workspaceName);
@@ -280,16 +259,19 @@ export async function createManagedWorkspace(
     await fs.mkdir(workspaceRoot);
     createdWorkspaceRoot = true;
     await FileSystemUtils.createDirectory(getWorkspaceChangesDir(workspaceRoot));
-    await writeWorkspaceSharedState(workspaceRoot, {
+    const sharedState: WorkspaceSharedState = {
       version: 1,
       name: workspaceName,
       links: Object.fromEntries(Object.keys(links).map((linkName) => [linkName, {}])),
-    });
-    await writeWorkspaceLocalState(workspaceRoot, {
+    };
+    const localState: WorkspaceLocalState = {
       version: 1,
       paths: links,
-    });
-    await ensureWorkspaceGitignore(workspaceRoot);
+      ...(preferredOpener ? { preferred_opener: preferredOpener } : {}),
+    };
+    await writeWorkspaceSharedState(workspaceRoot, sharedState);
+    await writeWorkspaceLocalState(workspaceRoot, localState);
+    await syncWorkspaceOpenSurface(workspaceRoot, sharedState, localState);
     await recordWorkspaceInRegistry(workspaceName, workspaceRoot);
   } catch (error) {
     if (createdWorkspaceRoot) {
@@ -644,7 +626,7 @@ export async function addWorkspaceLink(
     },
   };
   const updatedLocalState: WorkspaceLocalState = {
-    version: 1,
+    ...localState,
     paths: {
       ...localState.paths,
       [linkName]: resolvedPath,
@@ -653,6 +635,7 @@ export async function addWorkspaceLink(
 
   await writeWorkspaceSharedState(selected.root, updatedSharedState);
   await writeWorkspaceLocalState(selected.root, updatedLocalState);
+  await syncWorkspaceOpenSurface(selected.root, updatedSharedState, updatedLocalState);
   await recordSelectedWorkspaceAfterMutation(selected);
 
   return buildLinkMutationPayload(
@@ -681,7 +664,7 @@ export async function updateWorkspaceLink(
   }
 
   const updatedLocalState: WorkspaceLocalState = {
-    version: 1,
+    ...localState,
     paths: {
       ...localState.paths,
       [linkName]: resolvedPath,
@@ -689,6 +672,7 @@ export async function updateWorkspaceLink(
   };
 
   await writeWorkspaceLocalState(selected.root, updatedLocalState);
+  await syncWorkspaceOpenSurface(selected.root, sharedState, updatedLocalState);
   await recordSelectedWorkspaceAfterMutation(selected);
 
   return buildLinkMutationPayload(selected, sharedState, updatedLocalState, linkName, resolvedPath);

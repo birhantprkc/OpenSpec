@@ -4,13 +4,17 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { COMMAND_REGISTRY } from '../../src/core/completions/command-registry.js';
-import { createManagedWorkspace } from '../../src/commands/workspace/operations.js';
+import {
+  createManagedWorkspace,
+  resolveExistingDirectory,
+} from '../../src/commands/workspace/operations.js';
 import {
   WORKSPACE_CHANGES_DIR_NAME,
   WORKSPACE_LOCAL_STATE_FILE_NAME,
   WORKSPACE_LOCAL_STATE_IGNORE_PATTERN,
   WORKSPACE_METADATA_DIR_NAME,
   WORKSPACE_SHARED_STATE_FILE_NAME,
+  getWorkspaceCodeWorkspacePath,
   getManagedWorkspaceRoot,
   getWorkspaceLocalStatePath,
   getWorkspaceRegistryPath,
@@ -47,6 +51,10 @@ describe('workspace command', () => {
     return dir;
   }
 
+  function expectedExistingPath(existingPath: string): string {
+    return process.platform === 'win32' ? fs.realpathSync.native(existingPath) : existingPath;
+  }
+
   function parseJson(result: RunCLIResult): any {
     try {
       return JSON.parse(result.stdout);
@@ -57,9 +65,56 @@ describe('workspace command', () => {
     }
   }
 
-  async function setupWorkspace(name = 'platform', links: string[] = []): Promise<any> {
+  function createFakeExecutable(name: string): { binDir: string; logPath: string } {
+    const binDir = path.join(tempDir, 'fake-bin');
+    const logPath = path.join(tempDir, `${name}-launch.json`);
+    const recorderPath = path.join(binDir, 'record-launch.cjs');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(
+      recorderPath,
+      "const fs = require('node:fs');\nfs.writeFileSync(process.env.OPENSPEC_FAKE_OPEN_LOG, JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2) }));\n"
+    );
+
+    const posixExecutable = path.join(binDir, name);
+    fs.writeFileSync(posixExecutable, '#!/bin/sh\nnode "$OPENSPEC_FAKE_OPEN_RECORDER" "$@"\n');
+    fs.chmodSync(posixExecutable, 0o755);
+    fs.writeFileSync(
+      path.join(binDir, `${name}.cmd`),
+      '@echo off\r\nnode "%OPENSPEC_FAKE_OPEN_RECORDER%" %*\r\n'
+    );
+
+    return { binDir, logPath };
+  }
+
+  function envWithFakeExecutable(fake: { binDir: string; logPath: string }): NodeJS.ProcessEnv {
+    return {
+      ...env,
+      PATH: `${fake.binDir}${path.delimiter}${process.env.PATH ?? ''}`,
+      OPENSPEC_FAKE_OPEN_RECORDER: path.join(fake.binDir, 'record-launch.cjs'),
+      OPENSPEC_FAKE_OPEN_LOG: fake.logPath,
+    };
+  }
+
+  function readLaunchLog(logPath: string): { cwd: string; args: string[] } {
+    return JSON.parse(fs.readFileSync(logPath, 'utf-8'));
+  }
+
+  async function setupWorkspace(
+    name = 'platform',
+    links: string[] = [],
+    extraArgs: string[] = []
+  ): Promise<any> {
     const result = await runCLI(
-      ['workspace', 'setup', '--no-interactive', '--json', '--name', name, ...links.flatMap((link) => ['--link', link])],
+      [
+        'workspace',
+        'setup',
+        '--no-interactive',
+        '--json',
+        '--name',
+        name,
+        ...links.flatMap((link) => ['--link', link]),
+        ...extraArgs,
+      ],
       { cwd: tempDir, env }
     );
     expect(result.exitCode).toBe(0);
@@ -82,27 +137,30 @@ describe('workspace command', () => {
     const api = mkdir('repos/api');
     mkdir('repos/api/openspec/specs');
     const checkout = mkdir('repos/platform/apps/checkout');
+    const expectedApi = expectedExistingPath(api);
+    const expectedCheckout = expectedExistingPath(checkout);
 
     const setup = await setupWorkspace('platform', [`api=${api}`, checkout]);
+    const workspaceRoot = setup.workspace.root;
+    const expectedWorkspaceRoot = expectedExistingPath(workspaceRoot);
 
     expect(setup.status).toEqual([]);
     expect(setup.workspace.name).toBe('platform');
     expect(setup.workspace.links).toEqual([
       expect.objectContaining({
         name: 'api',
-        path: api,
-        repo_specs_path: path.join(api, 'openspec', 'specs'),
+        path: expectedApi,
+        repo_specs_path: path.join(expectedApi, 'openspec', 'specs'),
         status: [],
       }),
       expect.objectContaining({
         name: 'checkout',
-        path: checkout,
+        path: expectedCheckout,
         repo_specs_path: null,
         status: [],
       }),
     ]);
 
-    const workspaceRoot = setup.workspace.root;
     const sharedState = parseWorkspaceSharedState(
       fs.readFileSync(getWorkspaceSharedStatePath(workspaceRoot), 'utf-8')
     );
@@ -125,13 +183,33 @@ describe('workspace command', () => {
       },
     });
     expect(localState.paths).toEqual({
-      api,
-      checkout,
+      api: expectedApi,
+      checkout: expectedCheckout,
     });
-    expect(registry.workspaces.platform).toBe(workspaceRoot);
+    expect(localState.preferred_opener).toBeUndefined();
+    expect(registry.workspaces.platform).toBe(expectedWorkspaceRoot);
     expect(fs.readFileSync(path.join(workspaceRoot, '.gitignore'), 'utf-8')).toContain(
       WORKSPACE_LOCAL_STATE_IGNORE_PATTERN
     );
+    expect(fs.readFileSync(path.join(workspaceRoot, '.gitignore'), 'utf-8')).toContain(
+      'platform.code-workspace'
+    );
+    expect(fs.readFileSync(path.join(workspaceRoot, 'AGENTS.md'), 'utf-8')).toContain(
+      'OpenSpec Workspace Guidance'
+    );
+    expect(JSON.parse(fs.readFileSync(getWorkspaceCodeWorkspacePath(workspaceRoot, 'platform'), 'utf-8')).folders).toEqual([
+      {
+        path: '.',
+      },
+      {
+        name: 'api',
+        path: expectedApi,
+      },
+      {
+        name: 'checkout',
+        path: expectedCheckout,
+      },
+    ]);
 
     const list = await runCLI(['workspace', 'ls', '--json'], { cwd: tempDir, env });
     expect(list.exitCode).toBe(0);
@@ -139,10 +217,10 @@ describe('workspace command', () => {
     expect(listPayload.workspaces).toEqual([
       expect.objectContaining({
         name: 'platform',
-        root: workspaceRoot,
+        root: expectedWorkspaceRoot,
         links: [
-          expect.objectContaining({ name: 'api', path: api, status: [] }),
-          expect.objectContaining({ name: 'checkout', path: checkout, status: [] }),
+          expect.objectContaining({ name: 'api', path: expectedApi, status: [] }),
+          expect.objectContaining({ name: 'checkout', path: expectedCheckout, status: [] }),
         ],
         status: [],
       }),
@@ -152,18 +230,20 @@ describe('workspace command', () => {
   it('preserves equals signs in inferred and explicit setup link paths', async () => {
     const inferred = mkdir('repos/foo=bar');
     const explicit = mkdir('repos/api=service');
+    const expectedInferred = expectedExistingPath(inferred);
+    const expectedExplicit = expectedExistingPath(explicit);
 
     const setup = await setupWorkspace('equals-paths', [inferred, `api=${explicit}`]);
 
     expect(setup.workspace.links).toEqual([
       expect.objectContaining({
         name: 'api',
-        path: explicit,
+        path: expectedExplicit,
         status: [],
       }),
       expect.objectContaining({
         name: 'foo=bar',
-        path: inferred,
+        path: expectedInferred,
         status: [],
       }),
     ]);
@@ -172,9 +252,49 @@ describe('workspace command', () => {
       fs.readFileSync(getWorkspaceLocalStatePath(setup.workspace.root), 'utf-8')
     );
     expect(localState.paths).toEqual({
-      api: explicit,
-      'foo=bar': inferred,
+      api: expectedExplicit,
+      'foo=bar': expectedInferred,
     });
+  });
+
+  it('stores non-interactive preferred openers only when --opener is provided', async () => {
+    const api = mkdir('repos/api');
+    const codex = await setupWorkspace('codex-workspace', [`api=${api}`], ['--opener', 'codex']);
+    const editor = await setupWorkspace('editor-workspace', [`api=${api}`], ['--opener', 'editor']);
+    const unset = await setupWorkspace('unset-workspace', [`api=${api}`]);
+
+    expect(readLocalState(codex.workspace.root).preferred_opener).toEqual({
+      kind: 'agent',
+      id: 'codex',
+    });
+    expect(readLocalState(editor.workspace.root).preferred_opener).toEqual({
+      kind: 'editor',
+      id: 'vscode',
+    });
+    expect(readLocalState(unset.workspace.root).preferred_opener).toBeUndefined();
+
+    const invalid = await runCLI(
+      [
+        'workspace',
+        'setup',
+        '--no-interactive',
+        '--json',
+        '--name',
+        'invalid-opener',
+        '--link',
+        `api=${api}`,
+        '--opener',
+        'cursor',
+      ],
+      { cwd: tempDir, env }
+    );
+    expect(invalid.exitCode).toBe(1);
+    expect(parseJson(invalid).status[0]).toEqual(
+      expect.objectContaining({
+        code: 'unsupported_workspace_opener',
+        target: 'workspace.opener',
+      })
+    );
   });
 
   it('resolves relative setup, link, and relink paths before storing local state', async () => {
@@ -234,9 +354,29 @@ describe('workspace command', () => {
     });
   });
 
+  it('canonicalizes existing link directories on Windows before storing local paths', async () => {
+    const api = mkdir('repos/api');
+    const canonicalApi = path.join(tempDir, 'canonical', 'api');
+    const originalPlatform = process.platform;
+    const canonicalize = vi
+      .spyOn(FileSystemUtils, 'canonicalizeExistingPath')
+      .mockImplementation((targetPath) => (targetPath === api ? canonicalApi : targetPath));
+
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+
+    try {
+      await expect(resolveExistingDirectory(api)).resolves.toBe(canonicalApi);
+      expect(canonicalize).toHaveBeenCalledWith(api);
+    } finally {
+      canonicalize.mockRestore();
+      Object.defineProperty(process, 'platform', { value: originalPlatform });
+    }
+  });
+
   it('rejects duplicate setup link names without creating or rewriting a workspace', async () => {
     const firstApi = mkdir('repos/current/api');
     const secondApi = mkdir('repos/archive/api');
+    const expectedFirstApi = expectedExistingPath(firstApi);
 
     const duplicate = await runCLI(
       [
@@ -258,7 +398,7 @@ describe('workspace command', () => {
     expect(parseJson(duplicate).status[0]).toEqual(
       expect.objectContaining({
         code: 'duplicate_link_name',
-        message: expect.stringContaining(firstApi),
+        message: expect.stringContaining(expectedFirstApi),
         fix: expect.stringContaining('--link api-alt='),
       })
     );
@@ -443,6 +583,8 @@ describe('workspace command', () => {
     const billing = mkdir('repos/platform/services/billing');
     const billingNew = mkdir('repos/archive/billing');
     const duplicate = mkdir('repos/duplicate-billing');
+    const expectedBilling = expectedExistingPath(billing);
+    const expectedBillingNew = expectedExistingPath(billingNew);
 
     await setupWorkspace('platform', [`api=${api}`]);
 
@@ -451,7 +593,7 @@ describe('workspace command', () => {
     expect(parseJson(link).link).toEqual(
       expect.objectContaining({
         name: 'billing',
-        path: billing,
+        path: expectedBilling,
         status: [],
       })
     );
@@ -476,7 +618,7 @@ describe('workspace command', () => {
     expect(parseJson(relink).link).toEqual(
       expect.objectContaining({
         name: 'billing',
-        path: billingNew,
+        path: expectedBillingNew,
       })
     );
 
@@ -495,6 +637,7 @@ describe('workspace command', () => {
   it('links monorepo folders without editing the linked folder', async () => {
     const api = mkdir('repos/api');
     const packageDir = mkdir('monorepo/apps/checkout');
+    const expectedPackageDir = expectedExistingPath(packageDir);
     const sentinelPath = path.join(packageDir, 'package.json');
     fs.writeFileSync(sentinelPath, '{"name":"checkout"}\n');
     const entriesBefore = fs.readdirSync(packageDir).sort();
@@ -510,7 +653,7 @@ describe('workspace command', () => {
     expect(parseJson(link).link).toEqual(
       expect.objectContaining({
         name: 'checkout',
-        path: packageDir,
+        path: expectedPackageDir,
       })
     );
     expect(fs.readFileSync(sentinelPath, 'utf-8')).toBe('{"name":"checkout"}\n');
@@ -779,7 +922,7 @@ paths:
     expect(parseJson(doctor).workspace).toEqual(
       expect.objectContaining({
         name: 'checkout-web',
-        root: checkout.workspace.root,
+        root: expectedExistingPath(checkout.workspace.root),
       })
     );
 
@@ -809,12 +952,177 @@ paths:
     });
 
     expect(doctor.exitCode).toBe(1);
-    expect(doctor.stderr).toContain('Multiple OpenSpec workspaces are known. Pass --workspace <name>.');
+    expect(doctor.stderr).toContain('Multiple OpenSpec workspaces are known.');
+    expect(doctor.stderr).toContain('Pass --workspace <name>.');
     expect(doctor.stderr).toContain('openspec workspace doctor --workspace <name>');
+  });
+
+  it('opens a workspace through VS Code editor and agent overrides without changing stored preference', async () => {
+    const api = mkdir('repos/api');
+    const expectedApi = expectedExistingPath(api);
+    const web = mkdir('repos/web');
+    const setup = await setupWorkspace('platform', [`api=${api}`, `web=${web}`], ['--opener', 'editor']);
+    fs.rmSync(web, { recursive: true, force: true });
+    const code = createFakeExecutable('code');
+
+    const editorOpen = await runCLI(['workspace', 'open', 'platform', '--no-interactive'], {
+      cwd: tempDir,
+      env: envWithFakeExecutable(code),
+    });
+
+    expect(editorOpen.exitCode).toBe(0);
+    expect(editorOpen.stdout).toContain('Opening workspace: platform');
+    expect(editorOpen.stdout).toContain('Opener: VS Code editor');
+    expect(editorOpen.stdout).toContain('web ->');
+    const workspaceFolders = JSON.parse(
+      fs.readFileSync(getWorkspaceCodeWorkspacePath(setup.workspace.root, 'platform'), 'utf-8')
+    ).folders;
+    expect(workspaceFolders).toEqual([
+      {
+        path: '.',
+      },
+      {
+        name: 'api',
+        path: expectedApi,
+      },
+    ]);
+    const editorLaunch = readLaunchLog(code.logPath);
+    expect(fs.realpathSync.native(editorLaunch.cwd)).toBe(
+      fs.realpathSync.native(setup.workspace.root)
+    );
+    expect(editorLaunch.args).toEqual([
+      getWorkspaceCodeWorkspacePath(expectedExistingPath(setup.workspace.root), 'platform'),
+    ]);
+
+    const currentWorkspaceOpen = await runCLI(['workspace', 'open', '--editor', '--no-interactive'], {
+      cwd: path.join(setup.workspace.root, WORKSPACE_CHANGES_DIR_NAME),
+      env: envWithFakeExecutable(code),
+    });
+    expect(currentWorkspaceOpen.exitCode).toBe(0);
+
+    const codex = createFakeExecutable('codex');
+    const codexOpen = await runCLI(
+      ['workspace', 'open', '--workspace', 'platform', '--agent', 'codex', '--no-interactive'],
+      {
+        cwd: tempDir,
+        env: envWithFakeExecutable(codex),
+      }
+    );
+
+    expect(codexOpen.exitCode).toBe(0);
+    const codexLaunch = readLaunchLog(codex.logPath);
+    expect(fs.realpathSync.native(codexLaunch.cwd)).toBe(
+      fs.realpathSync.native(setup.workspace.root)
+    );
+    expect(codexLaunch.args).toEqual([
+      '--add-dir',
+      expectedApi,
+      'Open this OpenSpec workspace.',
+    ]);
+    expect(readLocalState(setup.workspace.root).preferred_opener).toEqual({
+      kind: 'editor',
+      id: 'vscode',
+    });
+  });
+
+  it('reports workspace open selection, unsupported flag, unset opener, and unavailable opener errors', async () => {
+    const api = mkdir('repos/api');
+    const web = mkdir('repos/web');
+
+    const noKnown = await runCLI(['workspace', 'open', '--no-interactive'], {
+      cwd: tempDir,
+      env,
+    });
+    expect(noKnown.exitCode).toBe(1);
+    expect(noKnown.stderr).toContain("No known OpenSpec workspaces. Run 'openspec workspace setup' first.");
+
+    const platform = await setupWorkspace('platform', [`api=${api}`]);
+    await setupWorkspace('checkout-web', [`web=${web}`]);
+
+    const conflict = await runCLI(
+      ['workspace', 'open', 'platform', '--workspace', 'checkout-web', '--editor', '--no-interactive'],
+      { cwd: tempDir, env }
+    );
+    expect(conflict.exitCode).toBe(1);
+    expect(conflict.stderr).toContain("positional 'platform'");
+    expect(conflict.stderr).toContain("--workspace 'checkout-web'");
+
+    const ambiguous = await runCLI(['workspace', 'open', '--no-interactive'], {
+      cwd: tempDir,
+      env,
+    });
+    expect(ambiguous.exitCode).toBe(1);
+    expect(ambiguous.stderr).toContain('Known workspaces: checkout-web, platform');
+
+    const unsupported = await runCLI(['workspace', 'open', '--prepare-only'], {
+      cwd: tempDir,
+      env,
+    });
+    expect(unsupported.exitCode).toBe(1);
+    expect(unsupported.stderr).toContain('future context/query surface');
+
+    const jsonUnsupported = await runCLI(['workspace', 'open', '--json'], {
+      cwd: tempDir,
+      env,
+    });
+    expect(jsonUnsupported.exitCode).toBe(1);
+    expect(parseJson(jsonUnsupported).status[0]).toEqual(
+      expect.objectContaining({
+        code: 'workspace_open_json_unsupported',
+      })
+    );
+
+    const changeUnsupported = await runCLI(['workspace', 'open', '--change', 'add-api'], {
+      cwd: tempDir,
+      env,
+    });
+    expect(changeUnsupported.exitCode).toBe(1);
+    expect(changeUnsupported.stderr).toContain('root workspace open only');
+
+    const unset = await runCLI(['workspace', 'open', 'platform', '--no-interactive'], {
+      cwd: tempDir,
+      env,
+    });
+    expect(unset.exitCode).toBe(1);
+    expect(unset.stderr).toContain('does not have a preferred opener');
+
+    const openerConflict = await runCLI(
+      ['workspace', 'open', 'platform', '--agent', 'codex', '--editor', '--no-interactive'],
+      {
+        cwd: tempDir,
+        env,
+      }
+    );
+    expect(openerConflict.exitCode).toBe(1);
+    expect(openerConflict.stderr).toContain('either --agent <tool> or --editor');
+
+    fs.writeFileSync(
+      getWorkspaceLocalStatePath(platform.workspace.root),
+      `version: 1
+paths:
+  api: ${api}
+preferred_opener:
+  kind: editor
+  id: vscode
+`
+    );
+    const unavailable = await runCLI(['workspace', 'open', 'platform', '--no-interactive'], {
+      cwd: tempDir,
+      env: {
+        ...env,
+        PATH: '',
+      },
+    });
+    expect(unavailable.exitCode).toBe(1);
+    expect(unavailable.stderr).toContain("'code' was not found on PATH");
+    expect(unavailable.stderr).toContain(
+      getWorkspaceCodeWorkspacePath(expectedExistingPath(platform.workspace.root), 'platform')
+    );
   });
 
   it('prints readable human output for setup, list, and doctor', async () => {
     const api = mkdir('repos/api');
+    const expectedApi = expectedExistingPath(api);
 
     const setup = await runCLI(
       ['workspace', 'setup', '--no-interactive', '--name', 'platform', '--link', `api=${api}`],
@@ -826,7 +1134,7 @@ paths:
     expect(setup.stdout).toContain('Location:');
     expect(setup.stdout).not.toContain('Root:');
     expect(setup.stdout).toContain('Linked repos or folders (1):');
-    expect(setup.stdout).toContain(`api -> ${api}`);
+    expect(setup.stdout).toContain(`api -> ${expectedApi}`);
     expect(setup.stdout).toContain('Planning path:');
     expect(setup.stdout).toContain('Workspace check:');
     expect(setup.stdout).toContain('No workspace issues found.');
@@ -839,7 +1147,7 @@ paths:
     expect(list.stdout).toContain('Location:');
     expect(list.stdout).not.toContain('Root:');
     expect(list.stdout).toContain('Linked repos or folders (1):');
-    expect(list.stdout).toContain(`api -> ${api}`);
+    expect(list.stdout).toContain(`api -> ${expectedApi}`);
 
     const doctor = await runCLI(['workspace', 'doctor', '--workspace', 'platform'], {
       cwd: tempDir,
@@ -865,8 +1173,10 @@ paths:
 
   it('registers workspace subcommands for shell completions', () => {
     const workspace = COMMAND_REGISTRY.find((command) => command.name === 'workspace');
+    const setup = workspace?.subcommands?.find((command) => command.name === 'setup');
     const link = workspace?.subcommands?.find((command) => command.name === 'link');
     const relink = workspace?.subcommands?.find((command) => command.name === 'relink');
+    const open = workspace?.subcommands?.find((command) => command.name === 'open');
 
     expect(workspace?.subcommands?.map((command) => command.name)).toEqual([
       'setup',
@@ -875,6 +1185,14 @@ paths:
       'link',
       'relink',
       'doctor',
+      'open',
+    ]);
+    expect(setup?.flags?.some((flag) => flag.name === 'opener')).toBe(true);
+    expect(setup?.flags?.find((flag) => flag.name === 'opener')?.values).toEqual([
+      'codex',
+      'claude',
+      'github-copilot',
+      'editor',
     ]);
     expect(link?.positionals).toEqual([
       { name: 'name-or-path', type: 'path', optional: true },
@@ -883,6 +1201,20 @@ paths:
     expect(relink?.positionals).toEqual([
       { name: 'name' },
       { name: 'path', type: 'path' },
+    ]);
+    expect(open?.positionals).toEqual([
+      { name: 'name', optional: true },
+    ]);
+    expect(open?.flags?.find((flag) => flag.name === 'agent')?.values).toEqual([
+      'codex',
+      'claude',
+      'github-copilot',
+    ]);
+    expect(open?.flags?.map((flag) => flag.name)).toEqual([
+      'workspace',
+      'agent',
+      'editor',
+      'no-interactive',
     ]);
   });
 });
