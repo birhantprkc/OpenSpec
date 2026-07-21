@@ -950,6 +950,71 @@ The system SHALL support the shared rule.
       expect(archives.some(a => a.includes(changeB))).toBe(false);
     });
 
+    it('should abort MODIFIED that drops a duplicate-named scenario (issue #1246 multiplicity)', async () => {
+      // Residual blind spot after the original #1246 gate: findMissingCurrentScenarios
+      // used Set membership, so two current scenarios sharing a name were both
+      // considered "present" when the MODIFIED block kept only one of them.
+      const mainSpecDir = path.join(tempDir, 'openspec', 'specs', 'dup-scenario');
+      await fs.mkdir(mainSpecDir, { recursive: true });
+      const mainSpecPath = path.join(mainSpecDir, 'spec.md');
+      await fs.writeFile(
+        mainSpecPath,
+        `# dup-scenario Specification
+
+## Purpose
+Duplicate scenario names within one requirement.
+
+## Requirements
+
+### Requirement: Login
+The system SHALL authenticate.
+
+#### Scenario: Validate
+- **WHEN** input is empty
+- **THEN** reject
+
+#### Scenario: Validate
+- **WHEN** input is malformed
+- **THEN** reject`
+      );
+
+      const changeName = 'drop-one-validate';
+      const changeDir = path.join(tempDir, 'openspec', 'changes', changeName);
+      const changeSpecDir = path.join(changeDir, 'specs', 'dup-scenario');
+      await fs.mkdir(changeSpecDir, { recursive: true });
+      await fs.writeFile(
+        path.join(changeSpecDir, 'spec.md'),
+        `# Drop One Validate - Change
+
+## MODIFIED Requirements
+
+### Requirement: Login
+The system SHALL authenticate.
+
+#### Scenario: Validate
+- **WHEN** input is empty
+- **THEN** reject`
+      );
+
+      await archiveCommand.execute(changeName, { yes: true, noValidate: true });
+
+      const updated = await fs.readFile(mainSpecPath, 'utf-8');
+      // Spec must be untouched — both Validate scenarios preserved
+      expect((updated.match(/#### Scenario: Validate/g) || []).length).toBe(2);
+      expect(updated).toContain('malformed');
+      expect(console.log).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'dup-scenario MODIFIED failed for header "### Requirement: Login" - current spec contains scenario(s) not present in the modified block: "Validate"'
+        )
+      );
+      expect(console.log).toHaveBeenCalledWith('Aborted. No files were changed.');
+
+      await expect(fs.access(changeDir)).resolves.not.toThrow();
+      const archiveDir = path.join(tempDir, 'openspec', 'changes', 'archive');
+      const archives = await fs.readdir(archiveDir);
+      expect(archives.some(a => a.includes(changeName))).toBe(false);
+    });
+
     it('should abort with a structural error when target spec hides requirements outside ## Requirements', async () => {
       const changeName = 'hidden-requirement-target';
       const changeDir = path.join(tempDir, 'openspec', 'changes', changeName);
@@ -1193,6 +1258,69 @@ The system will log all events.
       );
 
       // Change must NOT have been archived
+      const archiveDir = path.join(tempDir, 'openspec', 'changes', 'archive');
+      const archives = await fs.readdir(archiveDir);
+      expect(archives.some(a => a.includes(changeName))).toBe(false);
+    });
+
+    it('sets exit code 1 when the only delta spec sits at the specs/ root (#1385)', async () => {
+      const changeName = 'exit-root-delta';
+      const changeDir = path.join(tempDir, 'openspec', 'changes', changeName);
+      const changeSpecsDir = path.join(changeDir, 'specs');
+      await fs.mkdir(changeSpecsDir, { recursive: true });
+
+      // No capability folder: the merge path skips this file, so archiving it
+      // used to succeed while dropping the requirement.
+      const specContent = `## ADDED Requirements
+
+### Requirement: Request metrics
+The system SHALL record request metrics.
+
+#### Scenario: Request is counted
+- **WHEN** a request completes
+- **THEN** a counter is incremented`;
+      await fs.writeFile(path.join(changeSpecsDir, 'spec.md'), specContent);
+      await fs.writeFile(path.join(changeDir, 'tasks.md'), '- [x] Task 1\n');
+
+      await archiveCommand.execute(changeName, { yes: true });
+
+      expect(process.exitCode).toBe(1);
+      expect(console.log).toHaveBeenCalledWith(
+        expect.stringContaining('Validation failed')
+      );
+
+      const archiveDir = path.join(tempDir, 'openspec', 'changes', 'archive');
+      const archives = await fs.readdir(archiveDir);
+      expect(archives.some(a => a.includes(changeName))).toBe(false);
+    });
+
+    it('sets exit code 1 for a root-level specs/spec.md without delta headers (#1385)', async () => {
+      const changeName = 'exit-root-plain';
+      const changeDir = path.join(tempDir, 'openspec', 'changes', changeName);
+      const changeSpecsDir = path.join(changeDir, 'specs');
+      await fs.mkdir(changeSpecsDir, { recursive: true });
+
+      // Main-spec shape rather than delta shape: still never merged, so the
+      // gate must trip on the file existing, not on its headers.
+      const specContent = `# Metrics
+
+## Purpose
+Metrics for requests.
+
+## Requirements
+
+### Requirement: Request metrics
+The system SHALL record request metrics.
+
+#### Scenario: Request is counted
+- **WHEN** a request completes
+- **THEN** a counter is incremented`;
+      await fs.writeFile(path.join(changeSpecsDir, 'spec.md'), specContent);
+      await fs.writeFile(path.join(changeDir, 'tasks.md'), '- [x] Task 1\n');
+
+      await archiveCommand.execute(changeName, { yes: true });
+
+      expect(process.exitCode).toBe(1);
       const archiveDir = path.join(tempDir, 'openspec', 'changes', 'archive');
       const archives = await fs.readdir(archiveDir);
       expect(archives.some(a => a.includes(changeName))).toBe(false);
