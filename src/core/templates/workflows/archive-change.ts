@@ -35,9 +35,9 @@ ${STORE_SELECTION_GUIDANCE}
    Parse the JSON to understand:
    - \`schemaName\`: The workflow being used
    - \`planningHome\`, \`changeRoot\`, \`artifactPaths\`, and \`actionContext\`: path and scope context
-   - \`artifacts\`: List of artifacts with their status (\`done\` or other)
+   - \`artifacts\`: List of artifacts with their status (\`done\`, \`skipped\`, or other)
 
-   **If any artifacts are not \`done\`:**
+   **If any artifacts are neither \`done\` nor \`skipped\`** (skipped artifacts satisfy the requirement - the change declares skip_specs):
    - Display warning listing incomplete artifacts
    - Use **AskUserQuestion tool** to confirm user wants to proceed
    - Proceed if user confirms
@@ -91,14 +91,14 @@ ${STORE_SELECTION_GUIDANCE}
    mkdir -p "<planningHome.changesDir>/archive"
    \`\`\`
 
-   Generate target name using current date: \`YYYY-MM-DD-<change-name>\`
+   Generate the target name: use the change name as-is when it already starts with a \`YYYY-MM-DD-\` prefix; otherwise prepend the current date as \`YYYY-MM-DD-<change-name>\`. Never stack a second date (same rule as \`openspec archive\`).
 
    **Check if target already exists:**
    - If yes: Fail with error, suggest renaming existing archive or using different date
    - If no: Move \`changeRoot\` to the archive directory
 
    \`\`\`bash
-   mv "<changeRoot>" "<planningHome.changesDir>/archive/YYYY-MM-DD-<name>"
+   mv "<changeRoot>" "<planningHome.changesDir>/archive/<target-name>"
    \`\`\`
 
 6. **Display summary**
@@ -117,7 +117,7 @@ ${STORE_SELECTION_GUIDANCE}
 
 **Change:** <change-name>
 **Schema:** <schema-name>
-**Archived to:** the archive path derived from \`planningHome.changesDir\`/YYYY-MM-DD-<name>/
+**Archived to:** the archive path derived from \`planningHome.changesDir\`/<target-name>/
 **Specs:** <"✓ Synced to main specs" only if the step 4 verification passed; otherwise "No delta specs" or "Sync skipped">
 
 <"All artifacts complete. All tasks complete." — or, if archived with warnings, list them instead (e.g. "Archived with 2 incomplete tasks")>
@@ -168,9 +168,9 @@ ${STORE_SELECTION_GUIDANCE}
    Parse the JSON to understand:
    - \`schemaName\`: The workflow being used
    - \`planningHome\`, \`changeRoot\`, \`artifactPaths\`, and \`actionContext\`: path and scope context
-   - \`artifacts\`: List of artifacts with their status (\`done\` or other)
+   - \`artifacts\`: List of artifacts with their status (\`done\`, \`skipped\`, or other)
 
-   **If any artifacts are not \`done\`:**
+   **If any artifacts are neither \`done\` nor \`skipped\`** (skipped artifacts satisfy the requirement - the change declares skip_specs):
    - Display warning listing incomplete artifacts
    - Prompt user for confirmation to continue
    - Proceed if user confirms
@@ -224,14 +224,14 @@ ${STORE_SELECTION_GUIDANCE}
    mkdir -p "<planningHome.changesDir>/archive"
    \`\`\`
 
-   Generate target name using current date: \`YYYY-MM-DD-<change-name>\`
+   Generate the target name: use the change name as-is when it already starts with a \`YYYY-MM-DD-\` prefix; otherwise prepend the current date as \`YYYY-MM-DD-<change-name>\`. Never stack a second date (same rule as \`openspec archive\`).
 
    **Check if target already exists:**
    - If yes: Fail with error, suggest renaming existing archive or using different date
    - If no: Move \`changeRoot\` to the archive directory
 
    \`\`\`bash
-   mv "<changeRoot>" "<planningHome.changesDir>/archive/YYYY-MM-DD-<name>"
+   mv "<changeRoot>" "<planningHome.changesDir>/archive/<target-name>"
    \`\`\`
 
 6. **Display summary**
@@ -250,7 +250,7 @@ ${STORE_SELECTION_GUIDANCE}
 
 **Change:** <change-name>
 **Schema:** <schema-name>
-**Archived to:** the archive path derived from \`planningHome.changesDir\`/YYYY-MM-DD-<name>/
+**Archived to:** the archive path derived from \`planningHome.changesDir\`/<target-name>/
 **Specs:** ✓ Synced to main specs
 
 All artifacts complete. All tasks complete.
@@ -263,7 +263,7 @@ All artifacts complete. All tasks complete.
 
 **Change:** <change-name>
 **Schema:** <schema-name>
-**Archived to:** the archive path derived from \`planningHome.changesDir\`/YYYY-MM-DD-<name>/
+**Archived to:** the archive path derived from \`planningHome.changesDir\`/<target-name>/
 **Specs:** No delta specs
 
 All artifacts complete. All tasks complete.
@@ -276,7 +276,7 @@ All artifacts complete. All tasks complete.
 
 **Change:** <change-name>
 **Schema:** <schema-name>
-**Archived to:** the archive path derived from \`planningHome.changesDir\`/YYYY-MM-DD-<name>/
+**Archived to:** the archive path derived from \`planningHome.changesDir\`/<target-name>/
 **Specs:** Sync skipped (user chose to skip)
 
 **Warnings:**
@@ -293,7 +293,7 @@ Review the archive if this was not intentional.
 ## Archive Failed
 
 **Change:** <change-name>
-**Target:** the archive path derived from \`planningHome.changesDir\`/YYYY-MM-DD-<name>/
+**Target:** the archive path derived from \`planningHome.changesDir\`/<target-name>/
 
 Target archive directory already exists.
 
